@@ -1,0 +1,373 @@
+#!/usr/bin/python3
+
+# MIT License
+#
+# Copyright (c) 2018 dendrologist
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+
+Record a forest of trees.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --version             show program's version number and exit
+  --configuration-path CONFIGURATION_PATH
+                        The path to the forest configuration. (default:
+                        .forestrecorder)
+
+subcommand:
+  {configure,add,move,remove,history,dump}
+    configure           Create a forest configuration
+    add                 Add a node to the forest
+    move                Move a node in the forest
+    remove              Remove a node from the forest
+    history             Print a tab-delimited history of forest actions
+    dump                Print a JSON representation of the current forest
+
+"""
+import argparse
+import csv
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+__version__ = '0.0.0'
+
+_FOREST_ROOT = object()
+
+######################
+# Core functionality #
+######################
+
+
+def _add(forest, node, parent):
+    """Add the node to the forest."""
+    if node in forest:
+        raise ValueError('{} already present in forest'.format(node))
+
+    if parent == node:
+        tree = forest[_FOREST_ROOT]
+    elif parent not in forest:
+        raise ValueError('{} not present in forest'.format(parent))
+    else:
+        tree = forest[parent][parent]
+
+    tree[node] = {}
+    forest[node] = tree
+
+
+def _move(forest, node, parent):
+    """Move the node in the forest."""
+    # TODO: This should move the node (and its children) to the parent.
+    pass
+
+
+def _remove(forest, node, remove_children):
+    """Remove the node from the forest."""
+    if node not in forest:
+        raise ValueError('{} not present in forest'.format(node))
+
+    if remove_children:
+        # TODO: This should remove the node and all children
+        pass
+    else:
+        # TODO: If there are children, this should raise an
+        # exception. Otherwise, this should remove the node.
+        pass
+
+
+def _configuration(path):
+    """Return the configuration from the path."""
+    with path.open() as configuration_file:
+        return {
+            key: (pathlib.Path(value) if key.endswith('_path') else value)
+            for key, value in json.load(configuration_file).items()}
+
+
+def _forest(configuration):
+    """Return the forest from the configuration."""
+    actions_path = configuration['actions_path']
+    result = {_FOREST_ROOT: {}}
+    if actions_path.exists():
+        with actions_path.open() as actions_file:
+            reader = csv.DictReader(
+                actions_file, dialect='excel-tab',
+                fieldnames=('timestamp', 'timezone', 'action', 'node'),
+                restkey='args')
+            for row in reader:
+                node = row['node']
+                args = row.pop('args', ())
+                if row['action'] == 'add':
+                    func = _add
+                elif row['action'] == 'move':
+                    func = _move
+                else:
+                    assert row['action'] == 'remove'
+                    func = _remove
+
+                func(result, node, *args)
+
+        return result
+
+    else:
+        return result
+
+
+#########################################
+# Utilities for working with user input #
+#########################################
+
+
+def _prompt(question, *, default=None, constructor=str):
+    """Prompt for user input."""
+    while True:
+        data = input(
+            '{}{}{}'.format(
+                question,
+                ' (default: {})'.format(str(default)) if default else '',
+                os.linesep))
+        if data:
+            return constructor(data)
+        elif default:
+            return default
+        else:
+            print("Please enter a response.")
+
+
+def _prompt_key(mapping, key, *, question, default=None):
+    """Return a value for the key from the mapping or user input.
+
+    This modifies the mapping to add the value if user input was
+    required.
+
+    """
+    if not mapping[key]:
+        mapping[key] = _prompt(
+            question, default=default)
+
+    return mapping[key]
+
+
+def _normalize(string):
+    """Return a normalized version of the string.
+
+    The returned string will only contain lowercase letters, numbers,
+    and underscores.
+
+    """
+    return re.sub(r'\W', '', re.sub(r'[\s-]+', '_', string)).lower()
+
+
+##############################
+# The command line interface #
+##############################
+
+
+def _configure_command(mapping):
+    """Write the configuration to disk."""
+    # TODO: This should probably not overwrite existing configuration?
+    configuration_path = mapping.pop('configuration_path')
+    _prompt_key(
+        mapping, 'forest_name',
+        question="What should the forest be called?",
+        default='forest')
+    _prompt_key(
+        mapping, 'tree_name',
+        question="What should the trees in the forest be called?",
+        default='tree')
+    _prompt_key(
+        mapping, 'node_name',
+        question="What should the nodes in the forest be called?",
+        default='node')
+    _prompt_key(
+        mapping, 'child_to_parent_name',
+        question="What should the child-to-parent relationship be called?",
+        default='parent of')
+    _prompt_key(
+        mapping, 'actions_path',
+        question="Where should the actions be stored?",
+        default=str(configuration_path.parent / 'actions'))
+    with configuration_path.open('w') as outfile:
+        json.dump(mapping, outfile, indent=2, sort_keys=True)
+
+
+def _modify_configure_parser(parser):
+    """Modify the parser for the configure subcommand."""
+    parser.set_defaults(subcommand=_configure_command)
+    major, minor, patch = __version__.split('.')
+    parser.set_defaults(version=dict(major=major, minor=minor, patch=patch))
+    parser.add_argument(
+        '--forest-name',
+        help="The name of the forest.")
+    parser.add_argument(
+        '--tree-name',
+        help="The name of the trees.")
+    parser.add_argument(
+        '--node-name',
+        help="The name of the nodes.")
+    parser.add_argument(
+        '--child-to-parent-name',
+        help="The name of the child-to-parent relationship.")
+    parser.add_argument(
+        '--actions-path', type=pathlib.Path,
+        help="The path to the actions.")
+
+
+def _add_command(configuration, node, parent):
+    """Run the add subcommand, prompting for data when required."""
+    if not node:
+        node = _prompt(
+            question="What {} should be added to the {}?".format(
+                configuration['node_name'],
+                configuration['forest_name']))
+
+    if not parent:
+        parent = _prompt(
+            question="What {} is the {} {}?".format(
+                configuration['node_name'],
+                configuration['child_to_parent_name'],
+                node),
+            default=node)
+
+    forest = _forest(configuration)
+    assert parent in forest or not parent
+    _add(forest, node, parent)
+    with configuration['actions_path'].open('a') as actions_file:
+        struct_time = time.localtime()
+        csv.writer(actions_file, dialect='excel-tab').writerow(
+            (
+                time.mktime(struct_time), struct_time.tm_zone,
+                'add', node, parent))
+
+
+def _modify_add_parser(parser):
+    """Modify the parser for the add subcommand."""
+    parser.set_defaults(subcommand=_add_command)
+    parser.add_argument(
+        '--node', help="The node to add to the forest.")
+    parser.add_argument(
+        '--parent', help="The parent of the node.")
+
+
+def _move_command(configuration, node, parent):
+    """Run the move subcommand, prompting for data when required."""
+    # TODO: Implement
+    pass
+
+
+def _modify_move_parser(parser):
+    """Modify the parser for the move subcommand."""
+    # TODO: Implement
+    pass
+
+
+def _remove_command(configuration, node):
+    """Run the remove subcommand, prompting for data when required."""
+    # TODO: Implement
+    pass
+
+
+def _modify_remove_parser(parser):
+    """Modify the parser for the remove subcommand."""
+    # TODO: Implement
+    pass
+
+
+def _history_command(configuration):
+    """Print a tab-delimited history of forest actions."""
+    # TODO: Implement
+    pass
+
+
+def _modify_history_parser(parser):
+    """Modify the parser for the dump subcommand."""
+    pass
+
+
+def _dump_command(configuration):
+    """Print a JSON representation of the current forest."""
+    forest = _forest(configuration)
+    json.dump(forest[_FOREST_ROOT], sys.stdout)
+    sys.stdout.flush()
+
+
+def _modify_dump_parser(parser):
+    """Modify the parser for the dump subcommand."""
+    parser.set_defaults(subcommand=_dump_command)
+
+
+def main(args=None):
+    """Record a forest of trees."""
+    parser = argparse.ArgumentParser(
+        description=main.__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--version', action='version', version=__version__)
+    parser.add_argument(
+        '--configuration-path', type=pathlib.Path,
+        default=pathlib.Path('.forestrecorder'),
+        help="The path to the forest configuration.")
+    # NOTE: The `required` argument is not present in 3.4, so this
+    # instead prints usage if no subcommand is specified.
+    subparsers = parser.add_subparsers(title='subcommand')
+    _modify_configure_parser(
+        subparsers.add_parser(
+            'configure',
+            help="Create a forest configuration"))
+    _modify_add_parser(
+        subparsers.add_parser(
+            'add',
+            help="Add a node to the forest"))
+    _modify_move_parser(
+        subparsers.add_parser(
+            'move',
+            help="Move a node in the forest"))
+    _modify_remove_parser(
+        subparsers.add_parser(
+            'remove',
+            help="Remove a node from the forest"))
+    _modify_history_parser(
+        subparsers.add_parser(
+            'history',
+            help="Print a tab-delimited history of forest actions"))
+    _modify_dump_parser(
+        subparsers.add_parser(
+            'dump',
+            help="Print a JSON representation of the current forest"))
+    mapping = vars(parser.parse_args(args))
+    subcommand = mapping.pop('subcommand', None)
+    if subcommand:
+        if subcommand is _configure_command:
+            subcommand(mapping)
+        else:
+            configuration = _configuration(mapping.pop('configuration_path'))
+            subcommand(configuration, **mapping)
+
+    else:
+        parser.print_usage()
+
+
+if __name__ == '__main__':
+    main()
