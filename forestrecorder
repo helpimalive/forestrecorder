@@ -25,160 +25,357 @@
 # SOFTWARE.
 
 """
+usage: forestrecorder [-h] command [argument [argument ...]]
 
 Record a forest of trees.
 
-optional arguments:
-  -h, --help            show this help message and exit
-  --version             show program's version number and exit
-  --configuration-path CONFIGURATION_PATH
-                        The path to the forest configuration. (default:
-                        .forestrecorder)
+optional_arguments:
+  -h, --help            print this help message
 
-subcommand:
-  {configure,add,move,remove,history,dump}
-    configure           Create a forest configuration
-    add                 Add a node to the forest
-    move                Move a node in the forest
-    remove              Remove a node from the forest
-    history             Print a tab-delimited history of forest actions
-    dump                Print a JSON representation of the current forest
+command:
+    configure           create a forest configuration
+    add                 add a node to the forest
+    move                move a node in the forest
+    remove              remove a node from the forest
+    history             print a tab-delimited history of forest actions
+    dump                print a JSON representation of the current forest
+    version             print the current version number and exit
 
 """
 import argparse
+import collections
+import contextlib
 import csv
+import enum
 import json
+import operator
 import os
 import pathlib
 import re
+import shutil
 import sys
 import time
 
 __version__ = '0.0.0'
 
-_FOREST_ROOT = object()
+
+########################
+# Abnormal Termination #
+########################
+
+
+_ExitStatusPair = collections.namedtuple(
+    '_ExitStatusPair', ('status', 'message'))
+
+
+class _ExitStatus(enum.Enum):
+    """The exit statuses."""
+    success = _ExitStatusPair(
+        0, "success")
+    unknown = _ExitStatusPair(
+        1, "unknown error")
+    invocation = _ExitStatusPair(
+        2, "command line invocation error")
+    keyboard_interrupt = _ExitStatusPair(
+        3, "keyboard_interrupt")
+    input_error = _ExitStatusPair(
+        4, "unable to capture interactive input")
+    overwrite_configuration = _ExitStatusPair(
+        5, "cannot overwrite existing configuration")
+    write_configuration = _ExitStatusPair(
+        6, "unable to write configuration file")
+    read_configuration = _ExitStatusPair(
+        7, "unable to read configuration file")
+    parse_configuration = _ExitStatusPair(
+        8, "unable to parse configuration")
+    invalid_configuration = _ExitStatusPair(
+        9, "invalid configuration value")
+    missing_configuration = _ExitStatusPair(
+        10, "missing required configuration value")
+    append_actions = _ExitStatusPair(
+        11, "unable to append to actions file")
+    read_actions = _ExitStatusPair(
+        12, "unable to read actions file")
+    invalid_action = _ExitStatusPair(
+        13, "invalid command in actions file")
+    add_existing = _ExitStatusPair(
+        14, "attempted to add node already present in forest")
+    nonexisting_parent = _ExitStatusPair(
+        15, "parent of node not present in forest")
+    invalid_child = _ExitStatusPair(
+        16, "child not direct descendant of parent")
+    move_nonexisting = _ExitStatusPair(
+        17, "attempted to move node not present in forest")
+    remove_nonexisting = _ExitStatusPair(
+        18, "attempted to remove node not present in forest")
+    write_history = _ExitStatusPair(
+        19, "unable to write history to file")
+    write_dump = _ExitStatusPair(
+        20, "unable to write JSON representation to file")
+    write_version = _ExitStatusPair(
+        21, "unable to write version to file")
+
+def _exit_abnormally(name, message):
+    """Exit the program with the provided status and message."""
+    try:
+        print(message, file=sys.stderr)
+    finally:
+        sys.exit(getattr(_ExitStatus, name).value.status)
+
+
+@contextlib.contextmanager
+def _exit_on_error(name, *error_types):
+    """Catch a matching error and exit with the provided status."""
+    try:
+        yield
+    except error_types as exception:
+        _exit_abnormally(name, exception)
+
+
+##############
+# User input #
+##############
+
+
+def _newline_input(*messages):
+    """Return the input for the message followed by newline."""
+    return input("{}{}".format(' '.join(messages), os.linesep))
+
+
+def _prompt(value, message, *, default=None):
+    """Prompt for user input."""
+    if value is not None:
+        return value
+
+    with _exit_on_error('input_error', OSError, EOFError):
+        while True:
+            data = _newline_input(
+                message,
+                '(default: {})'.format(str(default)) if default else '')
+            if data:
+                return data
+            elif default:
+                return default
+            else:
+                print("Please enter a response.")
+
+
+def _prompt_key(mapping, key, message, *, default):
+    """Ensure the key in the mapping has a value from user input.
+
+    This modifies the mapping to add the value if user input was
+    required.
+
+    """
+    mapping[key] = _prompt(mapping.pop(key, None), message, default=default)
+
+
+def _prompt_choice(message, choices):
+    """Request a choice from the user."""
+    with _exit_on_error('input_error', OSError, EOFError):
+        while True:
+            result = _newline_input(message)
+            if result:
+                try:
+                    index = int(result)
+                except ValueError:
+                    print("Invalid input.")
+                else:
+                    if index in range(len(choices)):
+                        return choices[index]
+                    else:
+                        print("Invalid input.")
+
+            else:
+                break
+
+
+def _prompt_yes_or_no(message):
+    """Request yes or no from the user."""
+    with _exit_on_error('input_error', OSError, EOFError):
+        while True:
+            result = _newline_input(message, "Yes or no? (y/n)")
+            if result in ('y', 'Y', 'yes', 'Yes', 'YES'):
+                return True
+            elif result in ('n', 'N', 'no', 'No', 'NO'):
+                return False
+            else:
+                print("Invalid input.")
+
 
 ######################
 # Core functionality #
 ######################
 
 
-def _add(forest, node, parent):
-    """Add the node to the forest."""
+def _validate_add_node(forest, node):
+    """Validate the node may be added to the forest."""
     if node in forest:
-        raise ValueError('{} already present in forest'.format(node))
-
-    if parent == node:
-        tree = forest[_FOREST_ROOT]
-    elif parent not in forest:
-        raise ValueError('{} not present in forest'.format(parent))
-    else:
-        tree = forest[parent][parent]
-
-    tree[node] = {}
-    forest[node] = tree
+        _exit_abnormally(
+            'add_existing', "{} already present in forest".format(node))
 
 
-def _move(forest, node, parent):
-    """Move the node in the forest."""
-    # TODO: This should move the node (and its children) to the parent.
-    pass
+def _validate_parent(forest, parent):
+    """Validate the parent exists in the forest."""
+    if parent not in forest:
+        _exit_abnormally(
+            'nonexisting_parent', "{} not present in forest".format(parent))
 
 
-def _remove(forest, node, remove_children):
-    """Remove the node from the forest."""
+def _validate_child(forest, parent, child):
+    """Validate the node may be added to the forest."""
+    if child not in forest[parent].subforest:
+        _exit_abnormally(
+            'invalid_child', "{} not a child of {}".format(child, parent))
+
+
+def _validate_move_node(forest, node):
+    """Validate the node may be moved in the forest."""
     if node not in forest:
-        raise ValueError('{} not present in forest'.format(node))
+        _exit_abnormally(
+            'move_nonexisting', "{} not present in forest".format(node))
 
-    if remove_children:
-        # TODO: This should remove the node and all children
-        pass
+
+def _validate_remove_node(forest, node):
+    """Validate the node may be removed from the forest."""
+    if node not in forest:
+        _exit_abnormally(
+            'remove_nonexisting', "{} not present in forest".format(node))
+
+
+_ForestLocator = collections.namedtuple(
+    '_ForestLocator', ('ancestors', 'subforest'))
+
+
+def _add(forest, node, parent, *children):
+    """Add the node to the forest."""
+    _validate_add_node(forest, node)
+    _validate_parent(forest, parent)
+    parent_locator = forest[parent]
+    subforest = {}
+    parent_locator.subforest[node] = subforest
+    locator = _ForestLocator(
+        ancestors=(
+            parent_locator.ancestors + (parent,) if parent else (parent,)),
+        subforest=subforest)
+    forest[node] = locator
+    for child in children:
+        _validate_child(forest, parent, child)
+        subforest[child] = parent_locator.subforest.pop(child)
+        forest[child] = forest[child]._replace(
+            ancestors=(locator.ancestors + (node,)))
+
+
+def _move(forest, node, parent, *children):
+    """Move the node in the forest."""
+    _validate_move_node(forest, node)
+    _validate_parent(forest, parent)
+    subforest = forest[parent].subforest
+    subforest[node] = forest[forest[node].ancestors[-1]].subforest.pop(node)
+    for child in children:
+        _validate_child(forest, parent, child)
+        if child in subforest:
+            subforest[node][child] = subforest.pop(child)
+            forest[child] = forest[child]._replace(
+                ancestors=(forest[node].ancestors + (node,)))
+
+
+def _remove(forest, node, recursive):
+    """Remove the node from the forest."""
+    _validate_remove_node(forest, node)
+    locator = forest[node]
+    subforest = forest[locator.ancestors[-1]].subforest.pop(node)
+    if recursive:
+        for child in tuple(subforest):
+            _remove(forest, child, recursive)
+
     else:
-        # TODO: If there are children, this should raise an
-        # exception. Otherwise, this should remove the node.
-        pass
+        for child in subforest:
+            assert forest[child].ancestors[-1] == node
+            forest[child] = forest[child]._replace(ancestors=locator.ancestors)
+            forest[locator.ancestors[-1]].subforest[child] = (
+                forest[child].subforest)
+
+    del forest[node]
 
 
 def _configuration(path):
     """Return the configuration from the path."""
-    with path.open() as configuration_file:
+    with _exit_on_error('read_configuration', OSError):
+        with path.open() as configuration_file:
+            data = configuration_file.read()
+
+    with _exit_on_error('parse_configuration', ValueError):
+        parsed = json.loads(data)
+
+    with _exit_on_error('invalid_configuration', AttributeError):
+        items = parsed.items()
+
+    with _exit_on_error('invalid_configuration', ValueError):
         return {
             key: (pathlib.Path(value) if key.endswith('_path') else value)
-            for key, value in json.load(configuration_file).items()}
+            for key, value in items}
 
 
 def _forest(configuration):
-    """Return the forest from the configuration."""
+    """Return the forest from the configuration.
+
+    The forest is a nested mapping whose top level maps every node to
+    a namedtuple containing the node's ancestor chain (including the
+    None root) and the subforest corresponding to its
+    children. Consequently, looking at the subforest attribute of the
+    value corresponding to the None key gives the entire forest.
+
+    This structure permits fast lookup based on only the node name.
+
+    """
     actions_path = configuration['actions_path']
-    result = {_FOREST_ROOT: {}}
+    # NOTE: None is used as its own ancestor so that we can always use
+    # the rightmost value of the ancestors chain as the parent. It is
+    # hard to avoid special-casing the topmost element, and this
+    # method is a bit cleaner in python than checking for emptiness.
+    result = {None: _ForestLocator(ancestors=(None,), subforest={})}
     if actions_path.exists():
-        with actions_path.open() as actions_file:
-            reader = csv.DictReader(
-                actions_file, dialect='excel-tab',
-                fieldnames=('timestamp', 'timezone', 'action', 'node'),
-                restkey='args')
-            for row in reader:
-                node = row['node']
-                args = row.pop('args', ())
-                if row['action'] == 'add':
-                    func = _add
-                elif row['action'] == 'move':
-                    func = _move
-                else:
-                    assert row['action'] == 'remove'
-                    func = _remove
+        with _exit_on_error('read_actions', OSError):
+            with actions_path.open() as actions_file:
+                reader = csv.DictReader(
+                    actions_file, dialect='excel-tab',
+                    fieldnames=('timestamp', 'timezone', 'action', 'node'),
+                    restkey='args')
+                for row in reader:
+                    node = row['node']
+                    args = row.pop('args', ())
+                    if row['action'] == 'add':
+                        func = _add
+                    elif row['action'] == 'move':
+                        func = _move
+                    elif row['action'] == 'remove':
+                        func = _remove
+                    else:
+                        _exit_abnormally(
+                            'invalid_action',
+                            'invalid action: {}'.format(row['action']))
 
-                func(result, node, *args)
+                    with _exit_on_error('invalid_action', TypeError):
+                        func(
+                            result, node or None,
+                            *(arg or None for arg in args))
 
-        return result
+            return result
 
     else:
         return result
 
 
-#########################################
-# Utilities for working with user input #
-#########################################
-
-
-def _prompt(question, *, default=None, constructor=str):
-    """Prompt for user input."""
-    while True:
-        data = input(
-            '{}{}{}'.format(
-                question,
-                ' (default: {})'.format(str(default)) if default else '',
-                os.linesep))
-        if data:
-            return constructor(data)
-        elif default:
-            return default
-        else:
-            print("Please enter a response.")
-
-
-def _prompt_key(mapping, key, *, question, default=None):
-    """Return a value for the key from the mapping or user input.
-
-    This modifies the mapping to add the value if user input was
-    required.
-
-    """
-    if not mapping[key]:
-        mapping[key] = _prompt(
-            question, default=default)
-
-    return mapping[key]
-
-
-def _normalize(string):
-    """Return a normalized version of the string.
-
-    The returned string will only contain lowercase letters, numbers,
-    and underscores.
-
-    """
-    return re.sub(r'\W', '', re.sub(r'[\s-]+', '_', string)).lower()
+def _append_action(actions_path, command, *args):
+    """Append the action to the actions file."""
+    with _exit_on_error('append_actions', OSError):
+        with actions_path.open('a') as actions_file:
+            struct_time = time.localtime()
+            csv.writer(actions_file, dialect='excel-tab').writerow(
+                (
+                    time.mktime(struct_time), struct_time.tm_zone,
+                    command, *args))
 
 
 ##############################
@@ -186,187 +383,404 @@ def _normalize(string):
 ##############################
 
 
-def _configure_command(mapping):
-    """Write the configuration to disk."""
-    # TODO: This should probably not overwrite existing configuration?
+def _is_help(args):
+    """Return True if help is requested, False otherwise."""
+    return '-h' in args or '--help' in args
+
+
+class _ExitStatusArgumentParser(argparse.ArgumentParser):
+    """An argument parser that adds exit statuses to the epilog."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__exit_statuses = set()
+        self.add_exit_status(_ExitStatus.success)
+        self.add_exit_status(_ExitStatus.unknown)
+        self.add_exit_status(_ExitStatus.invocation)
+        self.add_exit_status(_ExitStatus.keyboard_interrupt)
+
+    def add_exit_status(self, exit_status):
+        """Add the exit status to a private key on the parser."""
+        self.__exit_statuses.add(exit_status)
+
+    def parse_args(self, args, *remaining_args, **kwargs):
+        """Parse the args. Must pass in args."""
+        if _is_help(args):
+            self.epilog = os.linesep.join((
+                "exit statuses:",
+                *(
+                    '  {} - {}'.format(
+                        exit_status.value.status, exit_status.value.message)
+                    for exit_status
+                    in sorted(
+                        self.__exit_statuses,
+                        key=operator.attrgetter('value')))))
+
+        return super().parse_args(args, *remaining_args, **kwargs)
+
+
+def _add_non_interactive(parser):
+    """Add the non_interactive argument to the parser."""
+    parser.add_argument(
+        '--non-interactive', action='store_true',
+        help="do not prompt the user to input missing arguments")
+    parser.add_exit_status(_ExitStatus.input_error)
+
+
+def _add_configuration_path(parser):
+    """Add the configuration_path argument to the parser."""
+    parser.add_argument(
+        '-c', '--configuration-path',
+        type=pathlib.Path, default=pathlib.Path('.forestrecorder'),
+        help="the configuration path. (default: .forestrecorder)")
+
+
+def _add_child(parser):
+    """Add the configuration_path argument to the parser."""
+    parser.add_argument(
+        '--child', action='append',
+        help=" ".join((
+            "a child of the parent to be moved to node",
+            "(may be specified multiple times)")))
+    parser.add_exit_status(_ExitStatus.invalid_child)
+
+
+def _maybe_required(args):
+    """Return True if interactive is unset, False otherwise."""
+    return '--non-interactive' in args and not _is_help(args)
+
+
+def _maybe_required_group(parser, args, *argument_pairs):
+    """Return an argument group for the argument pairs.
+
+    Each element in the group will have its required attribute
+    conditionally set.
+
+    """
+    required = _maybe_required(args)
+    group = parser.add_argument_group('interactive or required arguments')
+    for name, description in argument_pairs:
+        group.add_argument(name, required=required, help=description)
+
+    return group
+
+
+def _parse_configure(parser, args):
+    """Parse the configure command."""
+    parser.add_argument(
+        '-f', '--force', action='store_true',
+        help='overwrite existing configuration file')
+    _add_configuration_path(parser)
+    parser.add_exit_status(_ExitStatus.overwrite_configuration)
+    parser.add_exit_status(_ExitStatus.write_configuration)
+    _add_non_interactive(parser)
+    major, minor, patch = __version__.split('.')
+    parser.set_defaults(version=dict(major=major, minor=minor, patch=patch))
+    group = _maybe_required_group(
+        parser, args,
+        ('--forest-name', "the name of the forest"),
+        ('--tree-name', "the name of the trees"),
+        ('--node-name', "the name of the nodes"),
+        (
+            '--child-to-parent-name',
+            "the name of the child-to-parent relationship"))
+
+    group.add_argument(
+        '--actions-path', type=pathlib.Path, required=_maybe_required(args),
+        help="the path to the actions")
+    mapping = vars(parser.parse_args(args))
     configuration_path = mapping.pop('configuration_path')
+
+    if not mapping.pop('force') and configuration_path.exists():
+        _exit_abnormally(
+            'overwrite_configuration',
+            "use --force to overwrite existing configuration: {}".format(
+                configuration_path))
+
     _prompt_key(
-        mapping, 'forest_name',
-        question="What should the forest be called?",
+        mapping, 'forest_name', "What should the forest be called?",
         default='forest')
     _prompt_key(
-        mapping, 'tree_name',
-        question="What should the trees in the forest be called?",
+        mapping, 'tree_name', "What should the trees in the forest be called?",
         default='tree')
     _prompt_key(
-        mapping, 'node_name',
-        question="What should the nodes in the forest be called?",
+        mapping, 'node_name', "What should the nodes in the forest be called?",
         default='node')
     _prompt_key(
         mapping, 'child_to_parent_name',
-        question="What should the child-to-parent relationship be called?",
+        "What should the child-to-parent relationship be called?",
         default='parent of')
     _prompt_key(
-        mapping, 'actions_path',
-        question="Where should the actions be stored?",
+        mapping, 'actions_path', "Where should the actions be stored?",
         default=str(configuration_path.parent / 'actions'))
-    with configuration_path.open('w') as outfile:
-        json.dump(mapping, outfile, indent=2, sort_keys=True)
+    with _exit_on_error('write_configuration', OSError):
+        with configuration_path.open('w') as outfile:
+            json.dump(mapping, outfile, indent=2, sort_keys=True)
 
 
-def _modify_configure_parser(parser):
-    """Modify the parser for the configure subcommand."""
-    parser.set_defaults(subcommand=_configure_command)
-    major, minor, patch = __version__.split('.')
-    parser.set_defaults(version=dict(major=major, minor=minor, patch=patch))
-    parser.add_argument(
-        '--forest-name',
-        help="The name of the forest.")
-    parser.add_argument(
-        '--tree-name',
-        help="The name of the trees.")
-    parser.add_argument(
-        '--node-name',
-        help="The name of the nodes.")
-    parser.add_argument(
-        '--child-to-parent-name',
-        help="The name of the child-to-parent relationship.")
-    parser.add_argument(
-        '--actions-path', type=pathlib.Path,
-        help="The path to the actions.")
-
-
-def _add_command(configuration, node, parent):
-    """Run the add subcommand, prompting for data when required."""
-    if not node:
-        node = _prompt(
-            question="What {} should be added to the {}?".format(
-                configuration['node_name'],
-                configuration['forest_name']))
-
-    if not parent:
-        parent = _prompt(
-            question="What {} is the {} {}?".format(
+def _select_parent(configuration, forest, node, parent):
+    """Select a node in the forest, starting at parent."""
+    while forest[parent].subforest:
+        children = sorted(
+            child for child in
+            forest[parent].subforest
+            if child != node)
+        message = os.linesep.join((
+            "Which {} is the {} {}?".format(
                 configuration['node_name'],
                 configuration['child_to_parent_name'],
                 node),
-            default=node)
+            *(
+                '  {}: {}'.format(i, child)
+                for i, child in enumerate(children)),
+            "",
+            "Select from above: (default: None)"))
+        if parent:
+            message = os.linesep.join((
+                "Current chain:",
+                *(
+                    '  - {}'.format(ancestor)
+                    for ancestor in forest[parent].ancestors[1:] + (parent,)),
+                "", message))
 
+        result = _prompt_choice(message, children)
+        if result:
+            parent = result
+        else:
+            break
+
+    return parent
+
+
+def _select_children(configuration, forest, node, parent):
+    """Select a subset of children of the parent."""
+    children = []
+    for child in sorted(forest[parent].subforest):
+        if child != node and _prompt_yes_or_no(
+                "Is {} the {} {}?".format(
+                    node, configuration['child_to_parent_name'], child)):
+            children.append(child)
+
+    return children
+
+
+def _parse_node_command(
+        parser, args, *, node_help, prompt_message, validate_node):
+    """Parse a node command.
+
+    This returns the namespace, configuration, actions_path, forest,
+    and node.
+
+    """
+    _add_configuration_path(parser)
+    parser.add_exit_status(_ExitStatus.read_configuration)
+    parser.add_exit_status(_ExitStatus.parse_configuration)
+    parser.add_exit_status(_ExitStatus.invalid_configuration)
+    parser.add_exit_status(_ExitStatus.missing_configuration)
+    parser.add_exit_status(_ExitStatus.missing_configuration)
+    parser.add_exit_status(_ExitStatus.append_actions)
+    parser.add_exit_status(_ExitStatus.read_actions)
+    parser.add_exit_status(_ExitStatus.invalid_action)
+    _add_non_interactive(parser)
+    _maybe_required_group(parser, args, ('--node', node_help))
+    namespace = parser.parse_args(args)
+    configuration = _configuration(namespace.configuration_path)
     forest = _forest(configuration)
-    assert parent in forest or not parent
-    _add(forest, node, parent)
-    with configuration['actions_path'].open('a') as actions_file:
-        struct_time = time.localtime()
-        csv.writer(actions_file, dialect='excel-tab').writerow(
-            (
-                time.mktime(struct_time), struct_time.tm_zone,
-                'add', node, parent))
+    with _exit_on_error('missing_configuration', KeyError):
+        actions_path = configuration['actions_path']
+        node = _prompt(
+            namespace.node,
+            prompt_message.format(
+                configuration['node_name'],
+                configuration['forest_name']))
+        validate_node(forest, node)
+
+    return namespace, configuration, actions_path, forest, node
 
 
-def _modify_add_parser(parser):
-    """Modify the parser for the add subcommand."""
-    parser.set_defaults(subcommand=_add_command)
+def _parse_add_or_move(
+        parser, args, name, command, *,
+        parent_help, node_help, validate_node, prompt_message):
+    """Parse the add or move command."""
+    parser.add_argument('--parent', help=parent_help)
+    _add_child(parser)
+    parser.add_exit_status(_ExitStatus.nonexisting_parent)
+    namespace, configuration, actions_path, forest, node = _parse_node_command(
+        parser, args, node_help=node_help, prompt_message=prompt_message,
+        validate_node=validate_node)
+    parent = namespace.parent
+    children = namespace.child or []
+    with _exit_on_error('missing_configuration', KeyError):
+        _validate_parent(forest, parent)
+        if not namespace.non_interactive:
+            parent = _select_parent(configuration, forest, node, parent)
+            children.extend(
+                _select_children(configuration, forest, node, parent))
+
+    command(forest, node, parent, *children)
+    _append_action(actions_path, name, node, parent, *children)
+
+
+def _parse_add(parser, args):
+    """Parse the add command."""
+    parser.add_exit_status(_ExitStatus.add_existing)
+    _parse_add_or_move(
+        parser, args, 'add', _add,
+        parent_help="the parent of the node",
+        node_help="the node to add to the forest",
+        validate_node=_validate_add_node,
+        prompt_message="What {} should be added to the {}?")
+
+
+def _parse_move(parser, args):
+    """Parse the add command."""
+    parser.add_exit_status(_ExitStatus.move_nonexisting)
+    _parse_add_or_move(
+        parser, args, 'move', _move,
+        parent_help="the new parent of the node",
+        node_help="the node to move in the forest",
+        validate_node=_validate_move_node,
+        prompt_message="What {} should be moved in the {}?")
+
+
+def _parse_remove(parser, args):
+    """Parse the remove command."""
+    parser.add_exit_status(_ExitStatus.remove_nonexisting)
     parser.add_argument(
-        '--node', help="The node to add to the forest.")
-    parser.add_argument(
-        '--parent', help="The parent of the node.")
+        '-r', '--recursive', action='store_true',
+        help="remove all descendents of node recursively")
+    namespace, _, actions_path, forest, node = _parse_node_command(
+        parser, args,
+        node_help="the node to remove from the forest",
+        prompt_message="What {} should be removed in the {}?",
+        validate_node=_validate_remove_node)
+
+    _remove(forest, node, namespace.recursive)
+    _append_action(
+        actions_path, 'remove', node, 1 if namespace.recursive else None)
 
 
-def _move_command(configuration, node, parent):
-    """Run the move subcommand, prompting for data when required."""
-    # TODO: Implement
-    pass
+def _parse_history(parser, args):
+    """Parse the history command."""
+    _add_configuration_path(parser)
+    parser.add_exit_status(_ExitStatus.write_history)
+    namespace = parser.parse_args(args)
+    configuration = _configuration(namespace.configuration_path)
+    with _exit_on_error('missing_configuration', KeyError):
+        actions_path = configuration['actions_path']
+
+    if actions_path.exists():
+        with _exit_on_error('read_actions', OSError):
+            with actions_path.open() as actions_file:
+                with _exit_on_error('write_history', OSError):
+                    shutil.copyfileobj(actions_file, sys.stdout)
 
 
-def _modify_move_parser(parser):
-    """Modify the parser for the move subcommand."""
-    # TODO: Implement
-    pass
-
-
-def _remove_command(configuration, node):
-    """Run the remove subcommand, prompting for data when required."""
-    # TODO: Implement
-    pass
-
-
-def _modify_remove_parser(parser):
-    """Modify the parser for the remove subcommand."""
-    # TODO: Implement
-    pass
-
-
-def _history_command(configuration):
-    """Print a tab-delimited history of forest actions."""
-    # TODO: Implement
-    pass
-
-
-def _modify_history_parser(parser):
-    """Modify the parser for the dump subcommand."""
-    pass
-
-
-def _dump_command(configuration):
-    """Print a JSON representation of the current forest."""
+def _parse_dump(parser, args):
+    """Parse the dump command."""
+    _add_configuration_path(parser)
+    parser.add_exit_status(_ExitStatus.write_dump)
+    namespace = parser.parse_args(args)
+    configuration = _configuration(namespace.configuration_path)
     forest = _forest(configuration)
-    json.dump(forest[_FOREST_ROOT], sys.stdout)
-    sys.stdout.flush()
+    with _exit_on_error('write_dump', OSError):
+        json.dump(forest[None].subforest, sys.stdout)
 
 
-def _modify_dump_parser(parser):
-    """Modify the parser for the dump subcommand."""
-    parser.set_defaults(subcommand=_dump_command)
+def _parse_version(parser, args):
+    """Parse the version command."""
+    parser.add_exit_status(_ExitStatus.write_version)
+    parser.parse_args(args)
+    with _exit_on_error('write_version', OSError):
+        print(__version__)
+
+
+_CommandPair = collections.namedtuple(
+    '_CommandPair', ('command', 'description'))
+
+
+class _Command(enum.Enum):
+    """The commands."""
+    configure = _CommandPair(
+        _parse_configure, "create a forest configuration")
+    add = _CommandPair(
+        _parse_add, "add a node to the forest")
+    move = _CommandPair(
+        _parse_move, "move a node in the forest")
+    remove = _CommandPair(
+        _parse_remove, "remove a node from the forest")
+    history = _CommandPair(
+        _parse_history, "print a tab-delimited history of forest actions")
+    dump = _CommandPair(
+        _parse_dump, "print a JSON representation of the current forest")
+    version = _CommandPair(
+        _parse_version, "print the current version number and exit")
+
+
+def _main_parser_usage(parser):
+    """Return the usage string for the main parser.
+
+    This replaces the "optional" command argument with the command and
+    splat arguments.
+
+    """
+    return re.sub(
+        r'\[command\]', 'command [argument [argument ...]]',
+        parser.format_usage().rstrip())
 
 
 def main(args=None):
     """Record a forest of trees."""
-    parser = argparse.ArgumentParser(
-        description=main.__doc__,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--version', action='version', version=__version__)
-    parser.add_argument(
-        '--configuration-path', type=pathlib.Path,
-        default=pathlib.Path('.forestrecorder'),
-        help="The path to the forest configuration.")
-    # NOTE: The `required` argument is not present in 3.4, so this
-    # instead prints usage if no subcommand is specified.
-    subparsers = parser.add_subparsers(title='subcommand')
-    _modify_configure_parser(
-        subparsers.add_parser(
-            'configure',
-            help="Create a forest configuration"))
-    _modify_add_parser(
-        subparsers.add_parser(
-            'add',
-            help="Add a node to the forest"))
-    _modify_move_parser(
-        subparsers.add_parser(
-            'move',
-            help="Move a node in the forest"))
-    _modify_remove_parser(
-        subparsers.add_parser(
-            'remove',
-            help="Remove a node from the forest"))
-    _modify_history_parser(
-        subparsers.add_parser(
-            'history',
-            help="Print a tab-delimited history of forest actions"))
-    _modify_dump_parser(
-        subparsers.add_parser(
-            'dump',
-            help="Print a JSON representation of the current forest"))
-    mapping = vars(parser.parse_args(args))
-    subcommand = mapping.pop('subcommand', None)
-    if subcommand:
-        if subcommand is _configure_command:
-            subcommand(mapping)
-        else:
-            configuration = _configuration(mapping.pop('configuration_path'))
-            subcommand(configuration, **mapping)
+    # NOTE: This doesn't use subparsers so that `-h command` is
+    # equivalent to `command -h` while still permitting a naked
+    # `-h`. Moreover, subparsers are complicated, and need to be
+    # constructed entirely before beginning parsing. allow_abbrev is
+    # unset to guard against future changes and ensure the promised
+    # usage does not break. add_help is unset to customize the help
+    # message to look more like subparsers.
+    with  _exit_on_error('unknown', Exception):
+        with _exit_on_error('keyboard_interrupt', KeyboardInterrupt):
+            parser = argparse.ArgumentParser(
+                description=main.__doc__, allow_abbrev=False, add_help=False)
+            parser.add_argument('-h', '--help', action='store_true')
+            parser.add_argument(
+                'command',
+                choices=tuple(command.name for command in _Command),
+                nargs='?', metavar='command')
+            namespace, remaining_args = parser.parse_known_args(args)
+            if namespace.command:
+                if namespace.help:
+                    remaining_args.append('-h')
 
-    else:
-        parser.print_usage()
+            else:
+                if namespace.help:
+                    print(
+                        os.linesep.join((
+                            _main_parser_usage(parser),
+                            '',
+                            parser.description,
+                            '',
+                            'optional_arguments:',
+                            '  -h, --help            print this help message',
+                            '',
+                            'command:',
+                            *(
+                                '    {:20}{}'.format(
+                                    command.name, command.value.description)
+                                for command in _Command))))
+                    sys.exit()
+                else:
+                    _exit_abnormally('invocation', _main_parser_usage(parser))
+
+            command = getattr(_Command, namespace.command)
+            command.value.command(
+                _ExitStatusArgumentParser(
+                    prog='{} {}'.format(parser.prog, command.name),
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                    description='{}.'.format(
+                        command.value.description.capitalize()),
+                    allow_abbrev=False),
+                remaining_args)
 
 
 if __name__ == '__main__':
